@@ -1,0 +1,100 @@
+name: Deploy LeadFlow para AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # permite disparo manual
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: leadflow-api
+  ECS_CLUSTER: leadflow-cluster
+  ECS_SERVICE: leadflow-api-service
+  ECS_TASK_DEFINITION: leadflow-api
+  CONTAINER_NAME: leadflow-api
+
+jobs:
+  test:
+    name: Testes e Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+
+  build-and-deploy:
+    name: Build e Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e push da imagem Docker
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f docker/Dockerfile.backend -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Rodar migrations do Prisma
+        run: |
+          aws ecs run-task \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --task-definition leadflow-migrate \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.PRIVATE_SUBNET_IDS }}],securityGroups=[${{ secrets.ECS_SECURITY_GROUP }}]}"
+
+      - name: Baixar task definition atual
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Atualizar imagem na task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy no ECS (rolling deployment)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deploy do frontend no S3 + invalidação do CloudFront
+        run: |
+          npm run build --workspace=frontend
+          aws s3 sync frontend/out s3://leadflow-frontend-production --delete
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
