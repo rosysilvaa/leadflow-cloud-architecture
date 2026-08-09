@@ -1,0 +1,32 @@
+# ============================================================
+# Dockerfile - LeadFlow Frontend (Next.js)
+# Usado apenas se optar por rodar o frontend em container (SSR)
+# em vez de exportar estático para S3 + CloudFront
+# ============================================================
+
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# --- Runtime ---
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+EXPOSE 3000
+
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+CMD ["node", "server.js"]
